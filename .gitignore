@@ -1,0 +1,6 @@
+*.keystore
+*_debuggable
+apk-disassembled/
+apks_*/
+.idea/
+.claude/
