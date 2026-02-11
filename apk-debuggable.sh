@@ -19,6 +19,7 @@ ADB=""
 PACKAGE_NAME=""
 PULL_DIR=""
 DEBUGGABLE_DIR=""
+PROXY_HOST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Proxy configuration
@@ -433,6 +434,24 @@ start_proxy() {
         sleep 1
         waited=$((waited + 1))
     done
+
+    # Configure device to route traffic through proxy
+    local proxy_host=""
+    if [[ "$DEVICE_SERIAL" == emulator-* ]]; then
+        proxy_host="10.0.2.2"
+    else
+        # Physical device: find host's local IP
+        proxy_host=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+        if [[ -z "$proxy_host" ]]; then
+            print_warning "Could not determine host IP for physical device."
+            print_info "Manually set HTTP proxy on device to <your-host-ip>:$PROXY_PORT"
+            return
+        fi
+    fi
+
+    "$ADB" -s "$DEVICE_SERIAL" shell settings put global http_proxy "$proxy_host:$PROXY_PORT"
+    PROXY_HOST="$proxy_host"
+    print_step "Device proxy set to $proxy_host:$PROXY_PORT"
 }
 
 main() {
@@ -465,6 +484,7 @@ main() {
         echo -e "  ${GREEN}Proxy:${NC}      http://127.0.0.1:$PROXY_PORT"
         echo -e "  ${GREEN}Web UI:${NC}     http://localhost:$WEB_PORT"
         echo -e "  ${GREEN}Password:${NC}   $PROXY_PASSWORD"
+        [[ -n "$PROXY_HOST" ]] && echo -e "  ${GREEN}Device via:${NC} $PROXY_HOST:$PROXY_PORT"
         echo ""
         echo -e "  ${YELLOW}Install the mitmproxy CA certificate on the device:${NC}"
         echo "    1. Open Settings → search \"certificate\""
@@ -472,10 +492,9 @@ main() {
         echo "    3. Tap \"Install anyway\""
         echo "    4. Select \"mitmproxy-ca-cert.cer\" from internal storage"
         echo ""
-        echo "  Configure your device to use proxy 10.0.2.2:$PROXY_PORT"
-        echo "  (for emulators, 10.0.2.2 is the host machine)"
-        echo ""
-        echo "  Stop proxy:  docker stop $CONTAINER_NAME"
+        echo "  Stop proxy and clear device settings:"
+        echo "    docker stop $CONTAINER_NAME"
+        echo "    adb -s $DEVICE_SERIAL shell settings put global http_proxy :0"
     else
         echo ""
         echo "  To attach a debugger:"
