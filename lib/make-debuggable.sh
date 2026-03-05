@@ -225,6 +225,47 @@ inject_network_security_config() {
     fi
 }
 
+# Check for anti-tampering / integrity-protection libraries
+check_anti_tampering() {
+    local found=()
+
+    # Library filename:protection name pairs (Bash 3.2 compatible — no associative arrays)
+    local pairs=(
+        "libpairipcore.so:PairIP"
+        "libDexHelper.so:DexGuard"
+        "libDexHelper-x86.so:DexGuard"
+        "libjiagu.so:360 Jiagu"
+        "libjiagu_art.so:360 Jiagu"
+        "libsecexe.so:Bangcle"
+        "libsecmain.so:Bangcle"
+        "libtosprotection.so:Tencent Legu"
+        "libexec.so:Baidu"
+        "libexecmain.so:Baidu"
+    )
+
+    for pair in "${pairs[@]}"; do
+        local lib_name="${pair%%:*}"
+        local protection="${pair#*:}"
+        if find "$WORK_DIR/lib" -name "$lib_name" 2>/dev/null | grep -q .; then
+            found+=("$protection ($lib_name)")
+        fi
+    done
+
+    if [[ ${#found[@]} -gt 0 ]]; then
+        echo ""
+        print_warning "Anti-tampering protection detected!"
+        echo -e "  ${YELLOW}This app uses native integrity checks that will likely crash${NC}"
+        echo -e "  ${YELLOW}after patching because the APK signature has changed.${NC}"
+        echo ""
+        for item in "${found[@]}"; do
+            echo -e "  ${RED}•${NC} $item"
+        done
+        echo ""
+        echo -e "  The patched APK will still be created, but the app may crash on launch."
+        echo ""
+    fi
+}
+
 # Process a single APK (make debuggable)
 process_single_apk() {
     local input_apk="$1"
@@ -238,7 +279,18 @@ process_single_apk() {
 
     # Step 1: Disassemble
     print_step "Disassembling APK..."
-    $APKTOOL d -f -o "$WORK_DIR" "$input_apk"
+    if [[ "$TRUST_USER_CERTS" == true ]]; then
+        # Full resource decode needed so we can inject/overwrite network_security_config.xml
+        $APKTOOL d -f -o "$WORK_DIR" "$input_apk"
+    else
+        # --no-res: skip resource decoding — we only need AndroidManifest.xml.
+        # This avoids aapt2 "private resource" errors (e.g. android:style/TextAppearance.*)
+        # that occur when the app references private Android framework styles/resources.
+        $APKTOOL d -f --no-res -o "$WORK_DIR" "$input_apk"
+    fi
+
+    # Step 1b: Check for anti-tampering protections
+    check_anti_tampering
 
     # Step 2: Make debuggable
     print_step "Making APK debuggable..."

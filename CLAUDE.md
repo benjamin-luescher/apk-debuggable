@@ -15,6 +15,9 @@ Three Bash scripts for making Android APKs debuggable and intercepting traffic:
 # Automated end-to-end (device → extract → patch → reinstall)
 ./apk-debuggable.sh <app-name> [--device <serial>] [--keep] [--trust-user-certs] [--proxy]
 
+# Use a local APK file or split-APK directory
+./apk-debuggable.sh --apk <path> [--device <serial>] [--keep] [--trust-user-certs] [--proxy]
+
 # Single APK
 ./lib/make-debuggable.sh <path-to-apk> [output-apk] [--trust-user-certs]
 
@@ -46,17 +49,21 @@ There are no build, test, or lint commands.
 
 Automation wrapper that orchestrates the full device-to-device workflow. Each function sets globals consumed by subsequent steps:
 
-- **`parse_args()`** — Parses positional `APP_NAME` + optional `--device`, `--keep`, `--trust-user-certs`, `--proxy` flags (`--proxy` implies `--trust-user-certs`)
+- **`parse_args()`** — Parses positional `APP_NAME` + optional `--apk`, `--device`, `--keep`, `--trust-user-certs`, `--proxy` flags (`--proxy` implies `--trust-user-certs`). Validates that exactly one of `APP_NAME` or `--apk` is provided.
 - **`find_adb()`** — Discovers `adb` from SDK locations or PATH (same pattern as `find_android_tools()`)
+- **`find_aapt2()`** — Discovers `aapt2` from latest `build-tools/*/aapt2` in SDK locations, fallback to `command -v aapt2`. Used only in `--apk` mode for package name extraction.
 - **`select_device()`** — Parses `adb devices`, skips unauthorized; auto-selects if one device, interactive numbered menu if multiple. Fetches `ro.product.model` for display.
+- **`prepare_local_apk()`** — (when `--apk`) For directory input, uses the path as-is as `PULL_DIR`. For single APK, copies to temp dir `apks_local_<basename>`. Extracts `PACKAGE_NAME` via `aapt2 dump badging` (soft failure if aapt2 unavailable).
 - **`select_package()`** — Runs `adb shell pm list packages | grep -i <name>`; auto-selects if one match, interactive menu if multiple
 - **`pull_apks()`** — Gets paths via `adb shell pm path`, pulls each to `apks_<package>/` directory
 - **`make_debuggable()`** — Delegates to `./lib/make-debuggable.sh <pull-dir>` (directory mode), forwarding `--trust-user-certs` if set. Output lands in `<pull-dir>_debuggable/`.
-- **`install_apks()`** — Uninstalls existing package (non-fatal), then `adb install` or `adb install-multiple` depending on APK count
-- **`cleanup()`** — Removes temp directories unless `--keep` flag was set
+- **`install_apks()`** — Uninstalls existing package if `PACKAGE_NAME` is known (non-fatal), then `adb install` or `adb install-multiple` depending on APK count
+- **`cleanup()`** — Removes temp directories unless `--keep` flag was set. Never deletes a user-provided `--apk` directory.
 - **`start_proxy()`** — (when `--proxy`) Starts mitmproxy Docker container with `--set web_password`, pushes CA cert to device, waits for web UI. Always restarts the container fresh to avoid stale state.
 
 Proxy globals: `CONTAINER_NAME="mitmproxy-android"`, `PROXY_PORT=8080`, `WEB_PORT=8081`, `PROXY_PASSWORD="proxy"`, `MITMPROXY_DIR="$HOME/.mitmproxy"`.
+
+Main flow: `find_adb → select_device → [prepare_local_apk | select_package + pull_apks] → make_debuggable → install_apks → cleanup`
 
 Key conventions: all `adb` commands use `-s "$DEVICE_SERIAL"`, all `adb shell` output stripped of `\r` with `tr -d '\r'`, `grep` calls that may match zero use `|| true` to avoid `set -e` abort.
 

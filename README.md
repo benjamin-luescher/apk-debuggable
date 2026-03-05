@@ -39,6 +39,12 @@ Example: intercepting Wikipedia's API calls with mitmproxy after patching the ap
 
 # Intercept HTTPS traffic with mitmproxy (requires Docker)
 ./apk-debuggable.sh myapp --proxy
+
+# Use a local APK file (useful for emulators without Play Store)
+./apk-debuggable.sh --apk ./some-app.apk --device emulator-5554
+
+# Use a local split-APK directory
+./apk-debuggable.sh --apk ./split-apks/ --proxy
 ```
 
 The script will:
@@ -52,6 +58,7 @@ The script will:
 
 | Flag | Description |
 |------|-------------|
+| `--apk <path>` | Use a local APK file or split-APK directory instead of pulling from the device |
 | `--device <serial>` | Use a specific device (from `adb devices`) |
 | `--keep` | Keep intermediate files (pulled APKs and patched APKs) |
 | `--trust-user-certs` | Trust user-installed CA certificates (for HTTPS interception) |
@@ -84,6 +91,14 @@ Stop the proxy when done:
 ```bash
 docker stop mitmproxy-android
 ```
+
+## Limitations
+
+**Anti-tampering protection** — Some apps include native integrity-checking libraries (e.g. PairIP, DexGuard) that detect APK modifications and crash on launch. The script detects known anti-tampering libraries and warns you, but it cannot bypass them.
+
+**Workaround:** Use a **"Google APIs" emulator image** (not "Google Play") — these are `userdebug` builds where all apps are debuggable by default (`ro.debuggable=1`), no APK patching needed. Since these images don't include the Play Store, use `--apk` to install a local APK: `./apk-debuggable.sh --apk ./app.apk --device emulator-5554`.
+
+**Certificate pinning** — Apps that pin specific server certificates (common in banking apps) will reject connections even with the CA installed. Bypassing pinning requires tools like [Frida](https://frida.re/), which is out of scope.
 
 ## Advanced / Standalone Usage
 

@@ -12,14 +12,18 @@ NC='\033[0m' # No Color
 # Globals set by functions
 APP_NAME=""
 DEVICE_SERIAL=""
+SOURCE_SERIAL=""
 KEEP_FILES=false
 TRUST_USER_CERTS=false
 PROXY_MODE=false
 ADB=""
+AAPT2=""
 PACKAGE_NAME=""
 PULL_DIR=""
 DEBUGGABLE_DIR=""
 PROXY_HOST=""
+LOCAL_APK_PATH=""
+LOCAL_APK_IS_TEMP=false
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Proxy configuration
@@ -46,7 +50,8 @@ print_info() {
 }
 
 usage() {
-    echo "Usage: $0 <app-name> [--device <serial>] [--keep] [--trust-user-certs] [--proxy]"
+    echo "Usage: $0 <app-name> [--device <serial>] [--source <serial>] [--keep] [--trust-user-certs] [--proxy]"
+    echo "       $0 --apk <path> [--device <serial>] [--keep] [--trust-user-certs] [--proxy]"
     echo ""
     echo "Automated end-to-end APK debugging: extracts APKs from a connected"
     echo "Android device, makes them debuggable, and reinstalls."
@@ -55,7 +60,12 @@ usage() {
     echo "  app-name            Search term to find the package (e.g., 'myapp')"
     echo ""
     echo "Options:"
-    echo "  --device <serial>   Use a specific device (from 'adb devices')"
+    echo "  --apk <path>        Use a local APK file or split-APK directory instead of"
+    echo "                      pulling from the device"
+    echo "  --device <serial>   Target device for installation (from 'adb devices')"
+    echo "  --source <serial>   Pull APK from this device instead of the target device."
+    echo "                      Useful for grabbing apps from a Play Store emulator and"
+    echo "                      installing on a non-Play-Store emulator."
     echo "  --keep              Keep intermediate files (pulled APKs and patched APKs)"
     echo "  --trust-user-certs  Trust user-installed CA certificates (for HTTPS interception)"
     echo "  --proxy             Start mitmproxy in Docker for HTTPS traffic interception"
@@ -65,9 +75,12 @@ usage() {
     echo "Examples:"
     echo "  $0 chrome"
     echo "  $0 myapp --device emulator-5554"
+    echo "  $0 myapp --source emulator-5554 --device emulator-5556"
     echo "  $0 myapp --keep"
     echo "  $0 myapp --trust-user-certs"
     echo "  $0 myapp --proxy"
+    echo "  $0 --apk ./some-app.apk --device emulator-5554"
+    echo "  $0 --apk ./split-apks/ --proxy"
     exit 0
 }
 
@@ -81,12 +94,32 @@ parse_args() {
             --help|-h)
                 usage
                 ;;
+            --apk)
+                if [[ -z "$2" || "$2" == --* ]]; then
+                    print_error "--apk requires a file or directory path"
+                    exit 1
+                fi
+                LOCAL_APK_PATH="$2"
+                if [[ ! -e "$LOCAL_APK_PATH" ]]; then
+                    print_error "Path does not exist: $LOCAL_APK_PATH"
+                    exit 1
+                fi
+                shift 2
+                ;;
             --device)
                 if [[ -z "$2" || "$2" == --* ]]; then
                     print_error "--device requires a serial number argument"
                     exit 1
                 fi
                 DEVICE_SERIAL="$2"
+                shift 2
+                ;;
+            --source)
+                if [[ -z "$2" || "$2" == --* ]]; then
+                    print_error "--source requires a serial number argument"
+                    exit 1
+                fi
+                SOURCE_SERIAL="$2"
                 shift 2
                 ;;
             --keep)
@@ -118,8 +151,23 @@ parse_args() {
         esac
     done
 
-    if [[ -z "$APP_NAME" ]]; then
-        print_error "App name is required"
+    if [[ -z "$APP_NAME" && -z "$LOCAL_APK_PATH" ]]; then
+        print_error "App name or --apk <path> is required"
+        exit 1
+    fi
+
+    if [[ -n "$APP_NAME" && -n "$LOCAL_APK_PATH" ]]; then
+        print_error "Cannot use both app name and --apk at the same time"
+        exit 1
+    fi
+
+    if [[ -n "$SOURCE_SERIAL" && -n "$LOCAL_APK_PATH" ]]; then
+        print_error "Cannot use both --source and --apk at the same time"
+        exit 1
+    fi
+
+    if [[ -n "$SOURCE_SERIAL" && -z "$APP_NAME" ]]; then
+        print_error "--source requires an app name to search for on the source device"
         exit 1
     fi
 }
@@ -151,6 +199,73 @@ find_adb() {
     fi
 
     print_step "Found adb: $ADB"
+
+    # Ensure adb server is running and has discovered all devices
+    "$ADB" start-server 2>/dev/null
+}
+
+find_aapt2() {
+    local sdk_locations=(
+        "$HOME/Library/Android/sdk"
+        "/Users/$USER/Library/Android/sdk"
+        "$ANDROID_HOME"
+        "$ANDROID_SDK_ROOT"
+    )
+
+    for loc in "${sdk_locations[@]}"; do
+        if [[ -n "$loc" && -d "$loc/build-tools" ]]; then
+            # Find latest build-tools version with aapt2
+            local latest
+            latest=$(ls -1 "$loc/build-tools" 2>/dev/null | sort -V | tail -1)
+            if [[ -n "$latest" && -x "$loc/build-tools/$latest/aapt2" ]]; then
+                AAPT2="$loc/build-tools/$latest/aapt2"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$AAPT2" ]]; then
+        if command -v aapt2 &> /dev/null; then
+            AAPT2="$(command -v aapt2)"
+        fi
+    fi
+}
+
+prepare_local_apk() {
+    print_step "Preparing local APK: $LOCAL_APK_PATH"
+
+    if [[ -d "$LOCAL_APK_PATH" ]]; then
+        # Directory input — use as-is
+        PULL_DIR="$LOCAL_APK_PATH"
+        # Find base.apk for package name extraction
+        local base_apk="$PULL_DIR/base.apk"
+        if [[ ! -f "$base_apk" ]]; then
+            # Try to find any APK
+            base_apk=$(ls "$PULL_DIR"/*.apk 2>/dev/null | head -1)
+        fi
+        if [[ -n "$base_apk" && -n "$AAPT2" ]]; then
+            PACKAGE_NAME=$("$AAPT2" dump badging "$base_apk" 2>/dev/null | grep "^package:" | sed "s/.*name='//" | sed "s/'.*//" || true)
+        fi
+    else
+        # Single APK — copy to temp dir
+        local basename
+        basename=$(basename "$LOCAL_APK_PATH" .apk)
+        PULL_DIR="apks_local_${basename}"
+        LOCAL_APK_IS_TEMP=true
+        rm -rf "$PULL_DIR"
+        mkdir -p "$PULL_DIR"
+        cp "$LOCAL_APK_PATH" "$PULL_DIR/"
+        if [[ -n "$AAPT2" ]]; then
+            PACKAGE_NAME=$("$AAPT2" dump badging "$LOCAL_APK_PATH" 2>/dev/null | grep "^package:" | sed "s/.*name='//" | sed "s/'.*//" || true)
+        fi
+    fi
+
+    if [[ -n "$PACKAGE_NAME" ]]; then
+        print_step "Detected package: $PACKAGE_NAME"
+    else
+        print_warning "Could not detect package name (aapt2 not found or extraction failed)"
+        print_info "The app will be installed but the previous version won't be uninstalled automatically"
+    fi
 }
 
 select_device() {
@@ -174,7 +289,7 @@ select_device() {
         if [[ "$state" == "device" ]]; then
             serials+=("$serial")
             local model
-            model=$("$ADB" -s "$serial" shell getprop ro.product.model 2>/dev/null | tr -d '\r' || echo "unknown")
+            model=$("$ADB" -s "$serial" shell getprop ro.product.model < /dev/null 2>/dev/null | tr -d '\r' || echo "unknown")
             models+=("$model")
         elif [[ "$state" == "unauthorized" ]]; then
             print_warning "Device $serial is unauthorized — please accept the USB debugging prompt"
@@ -186,7 +301,27 @@ select_device() {
         exit 1
     fi
 
-    # If --device was specified, validate it
+    # Validate --source if specified
+    if [[ -n "$SOURCE_SERIAL" ]]; then
+        local source_found=false
+        for i in "${!serials[@]}"; do
+            if [[ "${serials[$i]}" == "$SOURCE_SERIAL" ]]; then
+                source_found=true
+                print_step "Source device: $SOURCE_SERIAL (${models[$i]})"
+                break
+            fi
+        done
+        if [[ "$source_found" == false ]]; then
+            print_error "Source device '$SOURCE_SERIAL' not found or not authorized."
+            echo "Available devices:"
+            for i in "${!serials[@]}"; do
+                echo "  ${serials[$i]}  (${models[$i]})"
+            done
+            exit 1
+        fi
+    fi
+
+    # Validate --device if specified
     if [[ -n "$DEVICE_SERIAL" ]]; then
         local found=false
         for s in "${serials[@]}"; do
@@ -205,32 +340,102 @@ select_device() {
         fi
         local model
         model=$("$ADB" -s "$DEVICE_SERIAL" shell getprop ro.product.model 2>/dev/null | tr -d '\r' || echo "unknown")
-        print_step "Using specified device: $DEVICE_SERIAL ($model)"
+        if [[ -n "$SOURCE_SERIAL" ]]; then
+            print_step "Target device: $DEVICE_SERIAL ($model)"
+        else
+            print_step "Using device: $DEVICE_SERIAL ($model)"
+        fi
         return
     fi
 
     # Auto-select if only one device
     if [[ ${#serials[@]} -eq 1 ]]; then
         DEVICE_SERIAL="${serials[0]}"
-        print_step "Using device: $DEVICE_SERIAL (${models[0]})"
+        if [[ -n "$SOURCE_SERIAL" ]]; then
+            print_step "Target device: $DEVICE_SERIAL (${models[0]})"
+        else
+            print_step "Using device: $DEVICE_SERIAL (${models[0]})"
+        fi
         return
     fi
 
-    # Interactive menu for multiple devices
-    echo ""
-    echo "Multiple devices found:"
+    # Multiple devices available, no --device specified.
+    # If pulling from device (APP_NAME mode) and no --source, prompt for source first.
+    if [[ -n "$APP_NAME" && -z "$SOURCE_SERIAL" ]]; then
+        echo ""
+        echo "Multiple devices found. Select source device (pull APK from):"
+        for i in "${!serials[@]}"; do
+            echo "  $((i + 1))) ${serials[$i]}  (${models[$i]})"
+        done
+        echo ""
+        while true; do
+            read -rp "Source [1-${#serials[@]}]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#serials[@]} ]]; then
+                SOURCE_SERIAL="${serials[$((choice - 1))]}"
+                print_step "Source device: $SOURCE_SERIAL (${models[$((choice - 1))]})"
+                break
+            fi
+            echo "Invalid selection. Enter a number between 1 and ${#serials[@]}."
+        done
+    fi
+
+    # Build target candidate list (exclude source in two-device mode)
+    local target_serials=()
+    local target_models=()
     for i in "${!serials[@]}"; do
-        echo "  $((i + 1))) ${serials[$i]}  (${models[$i]})"
+        if [[ -n "$SOURCE_SERIAL" && "${serials[$i]}" == "$SOURCE_SERIAL" ]]; then
+            continue
+        fi
+        target_serials+=("${serials[$i]}")
+        target_models+=("${models[$i]}")
+    done
+
+    # If no candidates after filtering (only source device connected), error
+    if [[ -n "$SOURCE_SERIAL" && ${#target_serials[@]} -eq 0 ]]; then
+        print_error "No target device found. Connect a second device/emulator to install on."
+        exit 1
+    fi
+
+    # Fall back to full list if no source filtering happened
+    if [[ ${#target_serials[@]} -eq 0 ]]; then
+        target_serials=("${serials[@]}")
+        target_models=("${models[@]}")
+    fi
+
+    # Auto-select if only one target candidate
+    if [[ ${#target_serials[@]} -eq 1 ]]; then
+        DEVICE_SERIAL="${target_serials[0]}"
+        if [[ -n "$SOURCE_SERIAL" ]]; then
+            print_step "Target device: $DEVICE_SERIAL (${target_models[0]})"
+        else
+            print_step "Using device: $DEVICE_SERIAL (${target_models[0]})"
+        fi
+        return
+    fi
+
+    # Interactive menu for target device
+    echo ""
+    if [[ -n "$SOURCE_SERIAL" ]]; then
+        echo "Select target device (install on):"
+    else
+        echo "Multiple devices found:"
+    fi
+    for i in "${!target_serials[@]}"; do
+        echo "  $((i + 1))) ${target_serials[$i]}  (${target_models[$i]})"
     done
     echo ""
     while true; do
-        read -rp "Select device [1-${#serials[@]}]: " choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#serials[@]} ]]; then
-            DEVICE_SERIAL="${serials[$((choice - 1))]}"
-            print_step "Using device: $DEVICE_SERIAL (${models[$((choice - 1))]})"
+        read -rp "Select device [1-${#target_serials[@]}]: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#target_serials[@]} ]]; then
+            DEVICE_SERIAL="${target_serials[$((choice - 1))]}"
+            if [[ -n "$SOURCE_SERIAL" ]]; then
+                print_step "Target device: $DEVICE_SERIAL (${target_models[$((choice - 1))]})"
+            else
+                print_step "Using device: $DEVICE_SERIAL (${target_models[$((choice - 1))]})"
+            fi
             return
         fi
-        echo "Invalid selection. Enter a number between 1 and ${#serials[@]}."
+        echo "Invalid selection. Enter a number between 1 and ${#target_serials[@]}."
     done
 }
 
@@ -238,7 +443,7 @@ select_package() {
     print_step "Searching for packages matching '$APP_NAME'..."
 
     local packages_raw
-    packages_raw=$("$ADB" -s "$DEVICE_SERIAL" shell pm list packages 2>&1 | tr -d '\r')
+    packages_raw=$("$ADB" -s "$SOURCE_SERIAL" shell pm list packages 2>&1 | tr -d '\r')
 
     local matches=()
     while IFS= read -r line; do
@@ -248,7 +453,7 @@ select_package() {
     if [[ ${#matches[@]} -eq 0 ]]; then
         print_error "No packages found matching '$APP_NAME'"
         echo "Try a broader search term, or list all packages with:"
-        echo "  adb -s $DEVICE_SERIAL shell pm list packages"
+        echo "  adb -s $SOURCE_SERIAL shell pm list packages"
         exit 1
     fi
 
@@ -281,7 +486,7 @@ pull_apks() {
     print_step "Getting APK paths for $PACKAGE_NAME..."
 
     local paths_raw
-    paths_raw=$("$ADB" -s "$DEVICE_SERIAL" shell pm path "$PACKAGE_NAME" 2>&1 | tr -d '\r')
+    paths_raw=$("$ADB" -s "$SOURCE_SERIAL" shell pm path "$PACKAGE_NAME" 2>&1 | tr -d '\r')
 
     local apk_paths=()
     while IFS= read -r line; do
@@ -305,7 +510,7 @@ pull_apks() {
         local apk_name
         apk_name=$(basename "$apk_path")
         print_info "Pulling $apk_name..."
-        "$ADB" -s "$DEVICE_SERIAL" pull "$apk_path" "$PULL_DIR/$apk_name"
+        "$ADB" -s "$SOURCE_SERIAL" pull "$apk_path" "$PULL_DIR/$apk_name"
     done
 
     print_step "APKs pulled to $PULL_DIR/"
@@ -335,8 +540,10 @@ make_debuggable() {
 }
 
 install_apks() {
-    print_step "Uninstalling existing $PACKAGE_NAME..."
-    "$ADB" -s "$DEVICE_SERIAL" uninstall "$PACKAGE_NAME" || print_warning "Uninstall failed (app may not be installed) — continuing"
+    if [[ -n "$PACKAGE_NAME" ]]; then
+        print_step "Uninstalling existing $PACKAGE_NAME..."
+        "$ADB" -s "$DEVICE_SERIAL" uninstall "$PACKAGE_NAME" || print_warning "Uninstall failed (app may not be installed) — continuing"
+    fi
 
     local apk_files=("$DEBUGGABLE_DIR"/*.apk)
     local apk_count=${#apk_files[@]}
@@ -366,7 +573,13 @@ cleanup() {
     fi
 
     print_step "Cleaning up temporary files..."
-    [[ -n "$PULL_DIR" && -d "$PULL_DIR" ]] && rm -rf "$PULL_DIR"
+    # Only delete PULL_DIR if we created it (not a user-provided directory)
+    if [[ -n "$LOCAL_APK_PATH" && -d "$LOCAL_APK_PATH" ]]; then
+        # User provided a directory — don't delete it
+        :
+    else
+        [[ -n "$PULL_DIR" && -d "$PULL_DIR" ]] && rm -rf "$PULL_DIR"
+    fi
     [[ -n "$DEBUGGABLE_DIR" && -d "$DEBUGGABLE_DIR" ]] && rm -rf "$DEBUGGABLE_DIR"
 }
 
@@ -463,8 +676,20 @@ main() {
 
     find_adb
     select_device
-    select_package
-    pull_apks
+
+    # Default source to target when not in two-device mode
+    if [[ -z "$SOURCE_SERIAL" ]]; then
+        SOURCE_SERIAL="$DEVICE_SERIAL"
+    fi
+
+    if [[ -n "$LOCAL_APK_PATH" ]]; then
+        find_aapt2
+        prepare_local_apk
+    else
+        select_package
+        pull_apks
+    fi
+
     make_debuggable
     install_apks
     cleanup
@@ -477,7 +702,15 @@ main() {
     echo ""
     echo -e "${GREEN}=== Done! ===${NC}"
     echo ""
-    echo -e "  $PACKAGE_NAME is now debuggable on $DEVICE_SERIAL"
+    if [[ -n "$PACKAGE_NAME" ]]; then
+        echo -e "  $PACKAGE_NAME is now debuggable on $DEVICE_SERIAL"
+    else
+        echo -e "  App is now debuggable on $DEVICE_SERIAL"
+    fi
+    if [[ "$SOURCE_SERIAL" != "$DEVICE_SERIAL" ]]; then
+        echo -e "  ${BLUE}Pulled from:${NC}  $SOURCE_SERIAL"
+        echo -e "  ${BLUE}Installed on:${NC} $DEVICE_SERIAL"
+    fi
 
     if [[ "$PROXY_MODE" == true ]]; then
         echo ""
@@ -498,7 +731,7 @@ main() {
     else
         echo ""
         echo "  To attach a debugger:"
-        echo "    Android Studio → Run → Attach Debugger to Android Process → $PACKAGE_NAME"
+        echo "    Android Studio → Run → Attach Debugger to Android Process${PACKAGE_NAME:+ → $PACKAGE_NAME}"
     fi
 }
 
